@@ -1,294 +1,277 @@
-"""Turvallinen salasananhallinta komentorivillä.
-
-Tämä skripti toteuttaa yksinkertaisen salasananhallinnan, joka salaa
-JSON‑tietokannan käyttäjän antamalla pääsalasanalla. Tiedosto
-``my_passwords.json`` sijaitsee aina ajettavan ohjelman tai skriptin
-vieressä, ja sen sisällä on 16 tavua suolaa, jota seuraa Fernet‑salattu
-JSON‑neste.
-
-Riippuvuudet
-------------
-* Python 3.6+
-* ``cryptography`` ja ``pyperclip`` (asennus: ``pip install cryptography pyperclip``)
-
-Käännös
--------
-Luodaksesi itsenäisen Windowsin suoritettavan tiedoston PyInstallerilla:
-
-    python -m PyInstaller --onefile --name="PassManager" password_manager.py
-
-Tuloksena syntyvää ``PassManager.exe``-tiedostoa voi jakaa ilman erillistä
-Python‑asennusta.
-"""
 import warnings
-# piilotetaan harmittomat varoitukset (esim. 32/64-bittiset) siistimmän konsolin vuoksi
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore") 
 
 import json
 import os
-import base64
 import sys
-import secrets
+import base64
+import secrets 
 import string
-import pyperclip
+import time
+import threading
+import subprocess 
+import atexit 
+from datetime import datetime
+from zxcvbn import zxcvbn 
+
+import pyperclip 
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# --- TIEDOSTOPOLUN MÄÄRITYS ---
-# Varmistetaan, että 'my_passwords.json' luodaan aina samaan hakemistoon
-# missä ohjelma (exe tai skripti) sijaitsee.
+# --- 1. SETUP & FOLDER STRUCTURE (VAKIOINTI) ---
+
 if getattr(sys, 'frozen', False):
-    # Jos ohjelmaa ajetaan käännettynä .exe-tiedostona:
-    application_path = os.path.dirname(sys.executable)
+    APP_PATH = os.path.dirname(sys.executable)
 else:
-    # Jos ohjelmaa ajetaan tavallisena Python‑skriptinä (.py):
-    application_path = os.path.dirname(os.path.abspath(__file__))
+    APP_PATH = os.path.dirname(os.path.abspath(__file__))
 
-# Yhdistetään kansion polku ja tiedoston nimi
-DATA_FILE = os.path.join(application_path, "my_passwords.json")
+# Määritellään alikansiot
+DB_DIR      = os.path.join(APP_PATH, "databases")
+LOG_DIR     = os.path.join(APP_PATH, "logs")
+BACKUP_DIR  = os.path.join(APP_PATH, "backups")
 
-# --- TIETOTURVA JA SALAUS ---
+# Määritellään tiedostot
+LOG_FILE  = os.path.join(LOG_DIR, "history.log")
+LOCK_FILE = os.path.join(DB_DIR, "app.lock") # Lukko piilotetaan db-kansioon
 
-def derive_key(password: str, salt: bytes) -> bytes:
-    """Johdetaan 32‑tavua pitkä Fernet‑avain salasanasta ja suolasta.
+def init_folders():
+    """Luo tarvittavat kansiot automaattisesti, jos ne puuttuvat."""
+    for folder in [DB_DIR, LOG_DIR, BACKUP_DIR]:
+        if not os.path.exists(folder):
+            try:
+                os.makedirs(folder)
+                print(f"Created system folder: {folder}")
+            except Exception as e:
+                print(f"Error creating folder {folder}: {e}")
 
-    Käytetään PBKDF2‑HMAC(SHA256):a 100 000 iteraatiolla; palautettu avain
-    on base64‑url‑turvallinen ja yhteensopiva ``cryptography.Fernet``-kirjaston
-    kanssa.
+# --- SINGLE INSTANCE LOCK ---
+def acquire_lock():
+    if os.path.exists(LOCK_FILE):
+        print(f"\n[ERROR] App is locked. Check '{LOCK_FILE}'")
+        sys.exit()
+    try:
+        with open(LOCK_FILE, 'w') as f: f.write("locked")
+    except: pass
 
-    :param password: käyttäjän antama pääsalasana
-    :param salt: 16 tavun satunnainen suola, luetaan tai kirjoitetaan levylle
-    :return: Fernet‑yhteensopivat base64‑koodatut avain‑tavut
-    """
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,  # vaikeuttaa brute-force -hyökkäyksiä huomattavasti
-        iterations=100000,
-    )
-    # Fernet vaatii base64-koodatun 32-tavuisen avaimen
+def release_lock():
+    if os.path.exists(LOCK_FILE):
+        try: os.remove(LOCK_FILE)
+        except: pass
+
+atexit.register(release_lock)
+
+# --- PERMISSIONS ---
+def restrict_file_permissions(filepath):
+    if os.name != 'nt' or not os.path.exists(filepath): return
+    try:
+        cmd = f'icacls "{filepath}" /inheritance:r /grant:r "%USERNAME%":F /grant:r *S-1-5-32-544:F'
+        subprocess.run(cmd, check=True, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except: pass
+
+# --- SECURITY CORE ---
+def check_master_strength(password):
+    res = zxcvbn(password)
+    if res['score'] < 3:
+        print(f"\n[WEAK] Score: {res['score']}/4. {res['feedback']['warning']}")
+        return False
+    return True
+
+def derive_key(password, salt):
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000)
     return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
-def load_data(master_password: str) -> tuple[dict, bytes] | tuple[None, None]:
-    """Lataa ja purkaa salasanasanakirja.
-
-    Tiedoston odotetaan sisältävän 16 tavua suolaa, jota seuraa
-    Fernet-salattu JSON‑data. Jos tiedostoa ei ole, palautetaan tyhjä
-    sanakirja ja ``None`` suolana; ``save_data`` luo silloin suolan.
-
-    Jos purku epäonnistuu (väärä salasana tai korruptoitunut tiedosto),
-    funktio palauttaa ``(None, None)`` merkkinä epäonnistumisesta.
-
-    :param master_password: käyttäjän syöttämä pääsalasana
-    :return: ``(tietosanakirja, suola)`` onnistuneesti, tai ``(None, None)`` epäonnistumisen
-    """
-    if not os.path.exists(DATA_FILE):
-        return {}, None  # aloitetaan alusta, jos tiedostoa ei ole
-
+def load_data(filepath, master_password):
+    if not os.path.exists(filepath): return {}, None 
     try:
-        with open(DATA_FILE, "rb") as f:
-            file_content = f.read()
-
-        # tiedoston rakenne: [16 tavua suolaa] + [salattu sisältö]
-        salt = file_content[:16]
-        encrypted_data = file_content[16:]
-
+        with open(filepath, "rb") as f:
+            content = f.read()
+        salt, enc_data = content[:16], content[16:]
         key = derive_key(master_password, salt)
         cipher = Fernet(key)
-        decrypted_data = cipher.decrypt(encrypted_data)
+        return json.loads(cipher.decrypt(enc_data).decode()), salt
+    except: return None, None
 
-        return json.loads(decrypted_data.decode()), salt
-    except Exception:
-        # purkuvirhe (todennäköisesti väärä salasana)
-        return None, None
-
-def save_data(data: dict, master_password: str, salt: bytes | None = None) -> bytes:
-    """Salaus ja tallennus levylle password‑sanakirjalle.
-
-    Jos ``salt`` on ``None``, generoidaan uusi 16‑tavun suola. Suola
-    kirjoitetaan aina tiedoston alkuun selkokielisenä, jotta se voidaan
-    käyttää uudelleen avaimen johdannassa.
-
-    :param data: sanakirja, jossa salasanat
-    :param master_password: käytössä oleva pääsalasana
-    :param salt: olemassa oleva suola tai ``None`` jos halutaan uusi
-    :return: käytetty suola (uusi tai olemassa oleva)
-    """
-    if salt is None:
-        salt = os.urandom(16)  # luodaan uusi suola ensimmäisellä tallennuksella
-
+def save_data(filepath, data, master_password, salt=None):
+    if salt is None: salt = os.urandom(16)
     key = derive_key(master_password, salt)
     cipher = Fernet(key)
-
-    json_string = json.dumps(data, indent=2)
-    encrypted_data = cipher.encrypt(json_string.encode())
-
-    with open(DATA_FILE, "wb") as f:
-        f.write(salt + encrypted_data)
-
+    try:
+        enc_data = cipher.encrypt(json.dumps(data, indent=2).encode())
+        with open(filepath, "wb") as f: f.write(salt + enc_data)
+        restrict_file_permissions(filepath)
+    except Exception as e: print(f"\n[ERROR] Save failed: {e}")
     return salt
 
-# --- APUTOIMINNOT ---
+# --- TOOLS ---
+def log_action(action):
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as f: f.write(f"[{ts}] {action}\n")
+        restrict_file_permissions(LOG_FILE)
+    except: pass
 
-def generate_password(length: int = 16) -> str:
-    """Palauttaa satunnaisesti luodun salasanan.
+def copy_to_clipboard_secure(text):
+    def clear(): time.sleep(30); pyperclip.copy("")
+    try:
+        pyperclip.copy(text)
+        print("(Copied to clipboard. Clears in 30s.)")
+        threading.Thread(target=clear, daemon=True).start()
+    except: pass
 
-    Salasana muodostuu ASCII‑kirjaimista, númeroista ja muutamasta
-    erikoismerkistä. Oletuspituus on 16 merkkiä.
-
-    :param length: haluttu pituus
-    :return: luotu salasana merkkijonona
-    """
+def generate_password(length=16):
     chars = string.ascii_letters + string.digits + "!@#$%^&*"
     return ''.join(secrets.choice(chars) for _ in range(length))
 
-# --- KÄYTTÖLIITTYMÄN TOIMINNOT ---
+# --- DATABASE MANAGEMENT ---
+def select_database_file():
+    """Listaa tiedostot 'databases'-alikansiosta."""
+    while True:
+        files = [f for f in os.listdir(DB_DIR) if f.endswith('.json')]
+        print(f"\n--- SELECT DATABASE (Folder: {DB_DIR}) ---")
+        if not files: print("(No databases yet)")
+        
+        for i, f in enumerate(files, 1): print(f"[{i}] {f}")
+        print(f"[{len(files)+1}] Create New Database")
+        
+        choice = input("> ").strip()
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(files):
+                return os.path.join(DB_DIR, files[idx])
+            elif idx == len(files):
+                new = input("New filename: ").strip()
+                if not new: continue
+                if not new.endswith(".json"): new += ".json"
+                return os.path.join(DB_DIR, new)
 
-def add_entry(data: dict, master_pwd: str, current_salt: bytes) -> bytes:
-    """Kysyy käyttäjältä tiedot ja lisää uuden salasanamerkin.
+# --- IMPORT / EXPORT ---
+def export_database(current_data, current_pwd):
+    """Tallentaa varmuuskopion 'backups'-kansioon."""
+    print("\n--- EXPORT TO BACKUPS ---")
+    name = input("Backup filename (e.g. 'safe_copy'): ").strip()
+    if not name: return
+    if not name.endswith(".json"): name += ".json"
+    
+    # Tallennetaan BACKUP_DIR kansioon
+    path = os.path.join(BACKUP_DIR, name)
+    save_data(path, current_data, current_pwd)
+    print(f"Backup saved to: {path}")
+    log_action(f"Backup created: {name}")
 
-    Merkintä tallennetaan heti, jotta levyllä oleva tietokanta pysyy
-    yhtenäisenä. Jos käyttäjä peruuttaa antamalla tyhjän otsikon, suola
-    palautetaan ennallaan.
-
-    :param data: nykyinen salasanasanakirja
-    :param master_pwd: käytössä oleva pääsalasana
-    :param current_salt: käytetty suola
-    :return: suola (päivitys jos uusi luotiin)
-    """
-    print("\n--- ADD NEW (LISÄÄ UUSI) ---")
-    title = input("Title / Site: ").strip()
-    if not title:
-        return current_salt
-
-    url = input("URL (optional): ").strip()
-    user = input("Username: ").strip()
-
-    choice = input("Generate strong password? (y/n): ").lower()
-    if choice == 'y':
-        pwd = generate_password()
-        print(f"Generated: {pwd}")
+def import_database(current_data, current_pwd, current_salt, db_filepath):
+    print("\n--- IMPORT DATA ---")
+    # Käyttäjä voi antaa täyden polun tai vain nimen (oletus: databases-kansio)
+    target = input("File to import (path or filename in databases/): ").strip()
+    
+    # Tarkistetaan onko se databases-kansiossa
+    if os.path.exists(os.path.join(DB_DIR, target)):
+        target_path = os.path.join(DB_DIR, target)
+    # Tarkistetaan onko se backups-kansiossa
+    elif os.path.exists(os.path.join(BACKUP_DIR, target)):
+        target_path = os.path.join(BACKUP_DIR, target)
+    # Tarkistetaan onko se täysi polku
+    elif os.path.exists(target):
+        target_path = target
     else:
-        pwd = input("Password: ").strip()
-
-    data[title] = {"url": url, "username": user, "password": pwd}
-
-    new_salt = save_data(data, master_pwd, current_salt)
-    print(f"Saved: {title}")
-    return new_salt
-
-def get_entry(data: dict) -> None:
-    """Etsii merkintöjä ja näyttää vastaavat salasanat.
-
-    Hakuehdot ovat kirjainkoon huomioimattomia alimerkkijonoja sivuston otsikosta. Ensimmäinen
-    osuma kopioidaan myös leikepöydälle, jos ``pyperclip``-kirjasto löytyy.
-
-    :param data: salasanasanakirja
-    """
-    print("\n--- GET PASSWORD (HAE) ---")
-    search = input("Search site name: ").strip().lower()
-
-    found = False
-    for title, info in data.items():
-        if search in title.lower():
-            print(f"\n--- {title} ---")
-            print(f"URL:  {info['url']}")
-            print(f"User: {info['username']}")
-            print(f"Pass: {info['password']}")
-            try:
-                pyperclip.copy(info['password'])
-                print("(Password copied to clipboard! / Kopioitu leikepöydälle!)")
-            except Exception:
-                pass
-            found = True
-
-    if not found:
-        print("No matches found (Ei tuloksia).")
-
-def delete_entry(data: dict, master_pwd: str, current_salt: bytes) -> None:
-    """Poistaa merkinnän, jonka otsikko täsmää tarkasti.
-
-    Poiston jälkeen tietokanta salataan uudelleen ja tallennetaan heti.
-
-    :param data: salasanasanakirja
-    :param master_pwd: käytössä oleva pääsalasana
-    :param current_salt: käytetty suola
-    """
-    print("\n--- DELETE (POISTA) ---")
-    title = input("Exact site title to delete: ").strip()
-
-    if title in data:
-        del data[title]
-        save_data(data, master_pwd, current_salt)
-        print(f"Deleted {title}.")
-    else:
-        print("Site not found.")
-
-def list_sites(data: dict) -> None:
-    """Tulostaa numeroidun listan kaikista tallennetuista otsikoista.
-
-    :param data: salasanasanakirja
-    """
-    print("\n--- SAVED SITES (TALLENNETUT) ---")
-    if not data:
-        print("(Empty / Tyhjä)")
+        print("File not found.")
         return
 
-    for i, title in enumerate(sorted(data.keys()), 1):
-        print(f"{i}. {title}")
+    target_pwd = input(f"Enter MASTER PASSWORD for '{os.path.basename(target_path)}': ").strip()
+    imported_data, _ = load_data(target_path, target_pwd)
+    
+    if imported_data is None:
+        print("Import failed.")
+        return
+    
+    count = 0
+    for k, v in imported_data.items():
+        if k not in current_data:
+            current_data[k] = v
+            count += 1
+            
+    save_data(db_filepath, current_data, current_pwd, current_salt)
+    print(f"Imported {count} items.")
+    log_action(f"Imported {count} items from {os.path.basename(target_path)}")
 
-# --- PÄÄOHJELMA ---
-
+# --- MAIN ---
 def main():
+    # 1. Init folders
+    init_folders()
+    acquire_lock()
+    
     print("="*30)
-    print("  SECURE PASSWORD MANAGER")
+    print("  PASSWORD MANAGER: ORGANIZED")
     print("="*30)
     
-    # 1. KIRJAUTUMINEN / ALUSTUS
-    if os.path.exists(DATA_FILE):
-        # Jos tiedosto on olemassa, kysy pääsalasanaa
-        master_pwd = input("ENTER MASTER PASSWORD: ").strip()
-        data, salt = load_data(master_pwd)
+    try:
+        db_path = select_database_file()
         
-        # Jos data on None, salasana oli väärä
-        if data is None:
-            print("\n!!! ACCESS DENIED !!!")
-            print("Wrong password or corrupt file.")
-            input("Press Enter to exit...")
-            return
-    else:
-        # Jos tiedostoa ei ole, luodaan uusi
-        print("No database found. Creating new setup.")
-        master_pwd = input("Create a MASTER PASSWORD: ").strip()
-        if not master_pwd:
-            print("Password cannot be empty.")
-            return
-        data = {}   # Tyhjä sanakirja
-        salt = None # Suola luodaan ensimmäisessä tallennuksessa
+        # Login Logic
+        if not os.path.exists(db_path):
+            print(f"Creating: {os.path.basename(db_path)}")
+            while True:
+                pwd = input("Set MASTER PASSWORD: ").strip()
+                if not pwd: continue
+                if check_master_strength(pwd):
+                    if input("Confirm: ") == pwd:
+                        data, master_pwd, salt = {}, pwd, None
+                        break
+                    print("Mismatch.")
+        else:
+            print(f"Opening: {os.path.basename(db_path)}")
+            attempts = 0
+            while attempts < 3:
+                pwd = input(f"Password ({attempts+1}/3): ").strip()
+                data, salt = load_data(db_path, pwd)
+                if data is not None:
+                    master_pwd = pwd
+                    log_action(f"Login: {os.path.basename(db_path)}")
+                    break
+                attempts += 1
+                time.sleep(2)
+            else:
+                print("Locked out."); sys.exit()
 
-    # 2. PÄÄVALIKKO (LOOP)
-    while True:
-        print("\n[1] Add New   [2] Get/Search   [3] List All")
-        print("[4] Delete    [5] Generate Only  [Q] Quit")
-        choice = input("> ").strip().lower()
-        
-        if choice == '1':
-            salt = add_entry(data, master_pwd, salt)
-        elif choice == '2':
-            get_entry(data)
-        elif choice == '3':
-            list_sites(data)
-        elif choice == '4':
-            delete_entry(data, master_pwd, salt)
-        elif choice == '5':
-            # Pelkkä salasanan generointi ilman tallennusta
-            p = generate_password()
-            print(f"\nGenerated: {p}")
-            pyperclip.copy(p)
-            print("(Copied to clipboard)")
-        elif choice in ('q', 'quit', 'exit'):
-            break
+        print("\nAccess Granted.")
+        while True:
+            print("\n[1] Add    [2] Get    [3] List")
+            print("[4] Delete [5] Backup [6] Import")
+            print("[7] Gen PW [8] History [Q] Quit")
+            c = input("> ").strip().lower()
+            
+            if c == '1': 
+                t = input("Title: ").strip()
+                if t:
+                    u = input("User: ")
+                    p = generate_password() if input("Gen? (y/n): ")=='y' else input("Pass: ")
+                    data[t] = {"url": "", "username": u, "password": p}
+                    salt = save_data(db_path, data, master_pwd, salt)
+                    print("Saved.")
+            elif c == '2':
+                s = input("Search: ").lower()
+                for k,v in data.items():
+                    if s in k.lower():
+                        print(f"\n{k} | {v['username']}")
+                        copy_to_clipboard_secure(v['password'])
+            elif c == '3':
+                for i,k in enumerate(sorted(data.keys()),1): print(f"{i}. {k}")
+            elif c == '4':
+                t = input("Delete: ")
+                if t in data:
+                    del data[t]; save_data(db_path, data, master_pwd, salt)
+                    print("Deleted.")
+            elif c == '5': export_database(data, master_pwd)
+            elif c == '6': import_database(data, master_pwd, salt, db_path)
+            elif c == '7': p=generate_password(); print(p); copy_to_clipboard_secure(p)
+            elif c == '8': 
+                if os.path.exists(LOG_FILE):
+                    with open(LOG_FILE) as f: print(f.read()[-500:])
+            elif c in ('q', 'quit'): break
+
+    except KeyboardInterrupt: print("\nBye.")
+    except Exception as e: print(f"Error: {e}"); input()
+    finally: release_lock()
 
 if __name__ == "__main__":
     main()
