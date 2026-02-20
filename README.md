@@ -1,7 +1,7 @@
 # passwordmanager
 
+This repository contains an application that is used locally on a computer without an internet connection to manage passwords. The application's code can be inspected in the "password_manager.py" file for what libraries it uses, and of course the code itself.
+
 The executable, or application is inside the folder named "dist". Can be run in any folder the user wants, it will create its own needed folders in that folder. 
 
 Code is commented inside password_manager.py if you are interested in reading that, but it's only in finnish for now. The application should be intuitive enough hopefully.
-
-This is a small python code that contains instructions inside password_manager.py on how to use it. It requires Python, and cryptography and pyperclip.
